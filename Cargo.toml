@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = [
+    "kinode-async",
+]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true

@@ -1,0 +1,14 @@
+[
+    {
+        "process_name": "kinode-async",
+        "process_wasm_path": "/kinode-async.wasm",
+        "on_exit": "Restart",
+        "request_networking": true,
+        "request_capabilities": [
+            "http-server:distro:sys",
+            "vfs:distro:sys"
+        ],
+        "grant_capabilities": [],
+        "public": true
+    }
+]
