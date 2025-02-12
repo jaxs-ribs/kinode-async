@@ -61,11 +61,7 @@ impl Executor {
 
     fn handle_message(&mut self, msg: Message) {
         match msg {
-            Message::Request {
-                body,
-                ..
-            } => {
-                // Example: parse as JSON
+            Message::Request { body, .. } => {
                 match serde_json::from_slice::<Value>(&body) {
                     Ok(json) => {
                         kiprintln!("--------------------------------");
@@ -73,19 +69,12 @@ impl Executor {
                         std::thread::sleep(std::time::Duration::from_secs(3));
                         Response::new().body(body).send().unwrap();
                         if json.get("hello") == Some(&Value::String("world".to_string())) {
-                            self.spawn(async {
-                                kiprintln!("(Spawned) Inside async: sending another request...");
-                                let response = ResponseWaiter::new(
-                                    serde_json::to_vec(&serde_json::json!({ "hello": "jaxson" }))
-                                        .unwrap(),
+                            spawn!(self, {
+                                send_request_and_log(
+                                    serde_json::json!({ "hello": "jaxson" }), 
                                     our(),
-                                )
-                                .await;
-
-                                match serde_json::from_slice::<Value>(&response) {
-                                    Ok(json) => kiprintln!("(Spawned) Got response: {json:?}"),
-                                    Err(e) => kiprintln!("(Spawned) Failed to parse response: {e}"),
-                                }
+                                    "Spawned"
+                                ).await
                             });
                         }
                     }
@@ -94,17 +83,13 @@ impl Executor {
                     }
                 }
             }
-            Message::Response {
-                body,
-                context,
-                ..
-            } => {
+            Message::Response { body, context, .. } => {
                 let correlation_id = context
                     .as_deref()
                     .map(|bytes| String::from_utf8_lossy(bytes).to_string())
                     .unwrap_or_else(|| "no_context".to_string());
 
-                let mut map = RESPONSE_WAITER_REGISTRY.lock().unwrap();
+                let map = RESPONSE_WAITER_REGISTRY.lock().unwrap();
                 if let Some(shared) = map.get(&correlation_id) {
                     shared.set_response(body);
                 } else {
@@ -117,13 +102,13 @@ impl Executor {
     fn poll_all_tasks(&mut self) {
         let mut ctx = Context::from_waker(noop_waker_ref());
         let mut completed = Vec::new();
-        
+
         for i in 0..self.tasks.len() {
             if matches!(self.tasks[i].future.as_mut().poll(&mut ctx), Poll::Ready(_)) {
                 completed.push(i);
             }
         }
-        
+
         // Remove completed tasks from highest index to lowest
         for i in completed.into_iter().rev() {
             self.tasks.remove(i);
@@ -212,31 +197,37 @@ impl Future for ResponseWaiter {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  Entry Point
-// -----------------------------------------------------------------------------
+async fn send_request_and_log(message: Value, target: Address, prefix: &str) {
+    let response = ResponseWaiter::new(
+        serde_json::to_vec(&message).unwrap(),
+        target,
+    )
+    .await;
+
+    match serde_json::from_slice::<Value>(&response) {
+        Ok(json) => kiprintln!("({prefix}) Got response: {json:?}"),
+        Err(e) => kiprintln!("({prefix}) Failed to parse response: {e}"),
+    }
+}
+
+#[macro_export]
+macro_rules! spawn {
+    ($executor:expr, $($code:tt)*) => {
+        $executor.spawn(async move { $($code)* })
+    };
+}
 
 call_init!(init);
-
 fn init(_our: Address) {
     kiprintln!("Starting simplified message-driven async process...");
 
     let mut executor = Executor::new();
-
-    executor.spawn(async {
-        kiprintln!("In main: sending initial request to ourselves...");
-
-        let response = ResponseWaiter::new(
-            serde_json::to_vec(&serde_json::json!({ "hello": "world" })).unwrap(),
+    spawn!(executor, {
+        send_request_and_log(
+            serde_json::json!({ "hello": "world" }), 
             our(),
-        )
-        .await;
-
-        match serde_json::from_slice::<Value>(&response) {
-            Ok(json) => kiprintln!("(main) Got response: {json:?}"),
-            Err(e) => kiprintln!("(main) Failed to parse response: {e}"),
-        }
+            "main"
+        ).await
     });
-
     executor.run();
 }
