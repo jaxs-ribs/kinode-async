@@ -1,11 +1,11 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use futures_util::task::noop_waker_ref;
-use lazy_static::lazy_static;
-use std::collections::HashMap;
+use uuid::Uuid;
 
 use kinode_process_lib::{
     await_message, call_init, kiprintln, our, Address, Message, Request, Response,
@@ -19,7 +19,6 @@ wit_bindgen::generate!({
     generate_unused_types: true,
     additional_derives: [serde::Deserialize, serde::Serialize, process_macros::SerdeJsonInto],
 });
-
 struct Task {
     future: Pin<Box<dyn Future<Output = ()>>>,
 }
@@ -66,12 +65,17 @@ impl Executor {
                     Ok(json) => {
                         kiprintln!("--------------------------------");
                         kiprintln!("Got request: {json:?}");
+                        // Just for demonstration: block a bit
                         std::thread::sleep(std::time::Duration::from_secs(3));
+                        
+                        // Send an immediate response echoing back the request body
                         Response::new().body(body).send().unwrap();
+
+                        // Maybe spawn a new request if "hello" == "world"
                         if json.get("hello") == Some(&Value::String("world".to_string())) {
                             spawn!(self, {
                                 send_request_and_log(
-                                    serde_json::json!({ "hello": "jaxson" }), 
+                                    serde_json::json!({ "hello": "jaxson" }),
                                     our(),
                                     "Spawned"
                                 ).await
@@ -89,12 +93,11 @@ impl Executor {
                     .map(|bytes| String::from_utf8_lossy(bytes).to_string())
                     .unwrap_or_else(|| "no_context".to_string());
 
-                let map = RESPONSE_WAITER_REGISTRY.lock().unwrap();
-                if let Some(shared) = map.get(&correlation_id) {
-                    shared.set_response(body);
-                } else {
-                    kiprintln!("Got response for unknown correlation_id: {correlation_id}");
-                }
+                // Store the received data in the global response registry
+                RESPONSE_REGISTRY.with(|registry| {
+                    let mut map = registry.borrow_mut();
+                    map.insert(correlation_id, body);
+                });
             }
         }
     }
@@ -104,79 +107,28 @@ impl Executor {
         let mut completed = Vec::new();
 
         for i in 0..self.tasks.len() {
-            if matches!(self.tasks[i].future.as_mut().poll(&mut ctx), Poll::Ready(_)) {
+            if let Poll::Ready(_) = self.tasks[i].future.as_mut().poll(&mut ctx) {
                 completed.push(i);
             }
         }
 
-        // Remove completed tasks from highest index to lowest
         for i in completed.into_iter().rev() {
             self.tasks.remove(i);
         }
     }
 }
 
-lazy_static! {
-    /// Map from correlation_id -> SharedResponse
-    static ref RESPONSE_WAITER_REGISTRY: Mutex<HashMap<String, SharedResponse>> =
-        Mutex::new(HashMap::new());
-}
-
-/// Shared state for a single "Wait for response" future.
-#[derive(Clone)]
-struct SharedResponse {
-    inner: Arc<Mutex<SharedResponseInner>>,
-}
-
-struct SharedResponseInner {
-    response: Option<Vec<u8>>,
-}
-
-impl SharedResponse {
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(SharedResponseInner { response: None })),
-        }
-    }
-
-    fn set_response(&self, data: Vec<u8>) {
-        let mut lock = self.inner.lock().unwrap();
-        lock.response = Some(data);
-    }
-
-    fn try_take(&self) -> Option<Vec<u8>> {
-        let mut lock = self.inner.lock().unwrap();
-        lock.response.take()
-    }
+thread_local! {
+    pub static RESPONSE_REGISTRY: RefCell<HashMap<String, Vec<u8>>> = RefCell::new(HashMap::new());
 }
 
 struct ResponseWaiter {
     correlation_id: String,
-    shared: SharedResponse,
 }
 
 impl ResponseWaiter {
-    fn new(request_body: Vec<u8>, target: Address) -> Self {
-        let correlation_id = uuid::Uuid::new_v4().to_string();
-
-        let shared = SharedResponse::new();
-        RESPONSE_WAITER_REGISTRY
-            .lock()
-            .unwrap()
-            .insert(correlation_id.clone(), shared.clone());
-
-        // Send the request now
-        Request::to(target)
-            .body(request_body)
-            .context(correlation_id.as_bytes().to_vec())
-            .expects_response(30)
-            .send()
-            .expect("failed to send request");
-
-        Self {
-            correlation_id,
-            shared,
-        }
+    fn new(correlation_id: String) -> Self {
+        Self { correlation_id }
     }
 }
 
@@ -184,12 +136,13 @@ impl Future for ResponseWaiter {
     type Output = Vec<u8>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let me = self.get_mut();
-        if let Some(data) = me.shared.try_take() {
-            RESPONSE_WAITER_REGISTRY
-                .lock()
-                .unwrap()
-                .remove(&me.correlation_id);
+        let correlation_id = &self.correlation_id;
+        let result = RESPONSE_REGISTRY.with(|registry| {
+            let mut map = registry.borrow_mut();
+            map.remove(correlation_id)
+        });
+        
+        if let Some(data) = result {
             Poll::Ready(data)
         } else {
             Poll::Pending
@@ -198,12 +151,16 @@ impl Future for ResponseWaiter {
 }
 
 async fn send_request_and_log(message: Value, target: Address, prefix: &str) {
-    let response = ResponseWaiter::new(
-        serde_json::to_vec(&message).unwrap(),
-        target,
-    )
-    .await;
+    let correlation_id = Uuid::new_v4().to_string();
+    let body = serde_json::to_vec(&message).expect("Failed to serialize JSON");
+    Request::to(target)
+        .body(body)
+        .context(correlation_id.as_bytes().to_vec())
+        .expects_response(30)
+        .send()
+        .expect("Failed to send request");
 
+    let response = ResponseWaiter::new(correlation_id).await;
     match serde_json::from_slice::<Value>(&response) {
         Ok(json) => kiprintln!("({prefix}) Got response: {json:?}"),
         Err(e) => kiprintln!("({prefix}) Failed to parse response: {e}"),
@@ -218,13 +175,14 @@ macro_rules! spawn {
 }
 
 call_init!(init);
+
 fn init(_our: Address) {
     kiprintln!("Starting simplified message-driven async process...");
 
     let mut executor = Executor::new();
     spawn!(executor, {
         send_request_and_log(
-            serde_json::json!({ "hello": "world" }), 
+            serde_json::json!({ "hello": "world" }),
             our(),
             "main"
         ).await
