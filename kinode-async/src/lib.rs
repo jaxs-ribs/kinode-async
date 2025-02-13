@@ -19,20 +19,17 @@ wit_bindgen::generate!({
     generate_unused_types: true,
     additional_derives: [serde::Deserialize, serde::Serialize, process_macros::SerdeJsonInto],
 });
-struct Task {
-    future: Pin<Box<dyn Future<Output = ()>>>,
+
+thread_local! {
+    static EXECUTOR: RefCell<Executor> = RefCell::new(Executor::new());
 }
 
-impl Task {
-    fn new(fut: impl Future<Output = ()> + 'static) -> Self {
-        Task {
-            future: Box::pin(fut),
-        }
-    }
+thread_local! {
+    pub static RESPONSE_REGISTRY: RefCell<HashMap<String, Vec<u8>>> = RefCell::new(HashMap::new());
 }
 
 struct Executor {
-    tasks: Vec<Task>,
+    tasks: Vec<Pin<Box<dyn Future<Output = ()>>>>,
 }
 
 impl Executor {
@@ -41,65 +38,7 @@ impl Executor {
     }
 
     fn spawn(&mut self, fut: impl Future<Output = ()> + 'static) {
-        self.tasks.push(Task::new(fut));
-    }
-
-    fn run(&mut self) -> ! {
-        loop {
-            self.poll_all_tasks();
-            match await_message() {
-                Ok(msg) => {
-                    self.handle_message(msg);
-                }
-                Err(e) => {
-                    kiprintln!("Got await_message() error: {e}");
-                }
-            }
-        }
-    }
-
-    fn handle_message(&mut self, msg: Message) {
-        match msg {
-            Message::Request { body, .. } => {
-                match serde_json::from_slice::<Value>(&body) {
-                    Ok(json) => {
-                        kiprintln!("--------------------------------");
-                        kiprintln!("Got request: {json:?}");
-                        // Just for demonstration: block a bit
-                        std::thread::sleep(std::time::Duration::from_secs(3));
-                        
-                        // Send an immediate response echoing back the request body
-                        Response::new().body(body).send().unwrap();
-
-                        // Maybe spawn a new request if "hello" == "world"
-                        if json.get("hello") == Some(&Value::String("world".to_string())) {
-                            spawn!(self, {
-                                send_request_and_log(
-                                    serde_json::json!({ "hello": "jaxson" }),
-                                    our(),
-                                    "Spawned"
-                                ).await
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        kiprintln!("Failed to parse request as JSON: {e}");
-                    }
-                }
-            }
-            Message::Response { body, context, .. } => {
-                let correlation_id = context
-                    .as_deref()
-                    .map(|bytes| String::from_utf8_lossy(bytes).to_string())
-                    .unwrap_or_else(|| "no_context".to_string());
-
-                // Store the received data in the global response registry
-                RESPONSE_REGISTRY.with(|registry| {
-                    let mut map = registry.borrow_mut();
-                    map.insert(correlation_id, body);
-                });
-            }
-        }
+        self.tasks.push(Box::pin(fut));
     }
 
     fn poll_all_tasks(&mut self) {
@@ -107,43 +46,39 @@ impl Executor {
         let mut completed = Vec::new();
 
         for i in 0..self.tasks.len() {
-            if let Poll::Ready(_) = self.tasks[i].future.as_mut().poll(&mut ctx) {
+            if let Poll::Ready(()) = self.tasks[i].as_mut().poll(&mut ctx) {
                 completed.push(i);
             }
         }
 
-        for i in completed.into_iter().rev() {
-            self.tasks.remove(i);
+        for idx in completed.into_iter().rev() {
+            let _ = self.tasks.remove(idx);
         }
     }
 }
-
-thread_local! {
-    pub static RESPONSE_REGISTRY: RefCell<HashMap<String, Vec<u8>>> = RefCell::new(HashMap::new());
-}
-
-struct ResponseWaiter {
+struct ResponseFuture {
     correlation_id: String,
 }
 
-impl ResponseWaiter {
+impl ResponseFuture {
     fn new(correlation_id: String) -> Self {
         Self { correlation_id }
     }
 }
 
-impl Future for ResponseWaiter {
+impl Future for ResponseFuture {
     type Output = Vec<u8>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let correlation_id = &self.correlation_id;
-        let result = RESPONSE_REGISTRY.with(|registry| {
+
+        let maybe_bytes = RESPONSE_REGISTRY.with(|registry| {
             let mut map = registry.borrow_mut();
             map.remove(correlation_id)
         });
-        
-        if let Some(data) = result {
-            Poll::Ready(data)
+
+        if let Some(bytes) = maybe_bytes {
+            Poll::Ready(bytes)
         } else {
             Poll::Pending
         }
@@ -160,8 +95,9 @@ async fn send_request_and_log(message: Value, target: Address, prefix: &str) {
         .send()
         .expect("Failed to send request");
 
-    let response = ResponseWaiter::new(correlation_id).await;
-    match serde_json::from_slice::<Value>(&response) {
+    let response_bytes = ResponseFuture::new(correlation_id).await;
+
+    match serde_json::from_slice::<Value>(&response_bytes) {
         Ok(json) => kiprintln!("({prefix}) Got response: {json:?}"),
         Err(e) => kiprintln!("({prefix}) Failed to parse response: {e}"),
     }
@@ -169,9 +105,51 @@ async fn send_request_and_log(message: Value, target: Address, prefix: &str) {
 
 #[macro_export]
 macro_rules! spawn {
-    ($executor:expr, $($code:tt)*) => {
-        $executor.spawn(async move { $($code)* })
+    ($($code:tt)*) => {
+        $crate::EXECUTOR.with(|ex| {
+            ex.borrow_mut().spawn(async move {
+                $($code)*
+            })
+        })
     };
+}
+
+fn handle_message(msg: Message) {
+    match msg {
+        Message::Request { body, .. } => {
+            match serde_json::from_slice::<Value>(&body) {
+                Ok(json) => {
+                    kiprintln!("--------------------------------");
+                    kiprintln!("Got request: {json:?}");
+
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+
+                    Response::new().body(body).send().unwrap();
+
+                    if json.get("hello") == Some(&Value::String("world".to_string())) {
+                        spawn! {
+                            send_request_and_log(
+                                serde_json::json!({ "hello": "jaxson" }),
+                                our(),
+                                "Spawned"
+                            ).await
+                        }
+                    }
+                }
+                Err(e) => kiprintln!("Failed to parse request as JSON: {e}"),
+            }
+        }
+        Message::Response { body, context, .. } => {
+            let correlation_id = context
+                .as_deref()
+                .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+                .unwrap_or_else(|| "no_context".to_string());
+
+            RESPONSE_REGISTRY.with(|registry| {
+                registry.borrow_mut().insert(correlation_id, body);
+            });
+        }
+    }
 }
 
 call_init!(init);
@@ -179,13 +157,24 @@ call_init!(init);
 fn init(_our: Address) {
     kiprintln!("Starting simplified message-driven async process...");
 
-    let mut executor = Executor::new();
-    spawn!(executor, {
+    spawn! {
         send_request_and_log(
             serde_json::json!({ "hello": "world" }),
             our(),
             "main"
         ).await
-    });
-    executor.run();
+    }
+
+    loop {
+        EXECUTOR.with(|ex| ex.borrow_mut().poll_all_tasks());
+
+        match await_message() {
+            Ok(msg) => {
+                handle_message(msg);
+            }
+            Err(e) => {
+                kiprintln!("Got await_message() error: {e}");
+            }
+        }
+    }
 }
